@@ -1,18 +1,15 @@
 enum ArgConfigType {
-  LLM_API_KEY = "LLM_API_KEY",
-  LLM_BASE_URL = "LLM_BASE_URL",
-  WORKSPACE_DIR = "WORKSPACE_DIR",
   LLM_MODEL = "LLM_MODEL",
-  SANDBOX_CONTAINER_IMAGE = "SANDBOX_CONTAINER_IMAGE",
-  RUN_AS_DEVIN = "RUN_AS_DEVIN",
-  LLM_EMBEDDING_MODEL = "LLM_EMBEDDING_MODEL",
-  LLM_NUM_RETRIES = "LLM_NUM_RETRIES",
-  LLM_COOLDOWN_TIME = "LLM_COOLDOWN_TIME",
-  DIRECTORY_REWRITE = "DIRECTORY_REWRITE",
-  MAX_ITERATIONS = "MAX_ITERATIONS",
   AGENT = "AGENT",
-
   LANGUAGE = "LANGUAGE",
+  LLM_API_KEY = "LLM_API_KEY",
 }
 
-export default ArgConfigType;
+const SupportedSettings: string[] = [
+  ArgConfigType.LLM_MODEL,
+  ArgConfigType.AGENT,
+  ArgConfigType.LANGUAGE,
+  ArgConfigType.LLM_API_KEY,
+];
+
+export { ArgConfigType, SupportedSettings };
