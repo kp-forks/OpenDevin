@@ -6,17 +6,25 @@ from dataclasses import dataclass, field
 import socketio
 
 from openhands.core.config import AppConfig
+from openhands.core.exceptions import AgentRuntimeUnavailableError
 from openhands.core.logger import openhands_logger as logger
 from openhands.events.stream import EventStream, session_exists
-from openhands.runtime.base import RuntimeUnavailableError
 from openhands.server.session.conversation import Conversation
 from openhands.server.session.session import ROOM_KEY, Session
 from openhands.server.session.session_init_data import SessionInitData
 from openhands.storage.files import FileStore
+from openhands.utils.async_utils import call_sync_from_async
 from openhands.utils.shutdown_listener import should_continue
 
 _REDIS_POLL_TIMEOUT = 1.5
 _CHECK_ALIVE_INTERVAL = 15
+
+_CLEANUP_INTERVAL = 15
+_CLEANUP_EXCEPTION_WAIT_TIME = 15
+
+
+class ConversationDoesNotExistError(Exception):
+    pass
 
 
 @dataclass
@@ -160,7 +168,7 @@ class SessionManager:
             c = Conversation(sid, file_store=self.file_store, config=self.config)
             try:
                 await c.connect()
-            except RuntimeUnavailableError as e:
+            except AgentRuntimeUnavailableError as e:
                 logger.error(f'Error connecting to conversation {c.sid}: {e}')
                 return None
             end_time = time.time()
@@ -169,6 +177,25 @@ class SessionManager:
             )
             self._active_conversations[sid] = (c, 1)
             return c
+
+    async def join_conversation(self, sid: str, connection_id: str) -> EventStream:
+        await self.sio.enter_room(connection_id, ROOM_KEY.format(sid=sid))
+        self.local_connection_id_to_session_id[connection_id] = sid
+
+        # If we have a local session running, use that
+        session = self.local_sessions_by_sid.get(sid)
+        if session:
+            logger.info(f'found_local_session:{sid}')
+            return session.agent_session.event_stream
+
+        # If there is a remote session running, retrieve existing events for that
+        redis_client = self._get_redis_client()
+        if redis_client and await self._is_session_running_in_cluster(sid):
+            return EventStream(sid, self.file_store)
+
+        raise ConversationDoesNotExistError(
+            f'no_conversation_for_id:{connection_id}:{sid}'
+        )
 
     async def detach_from_conversation(self, conversation: Conversation):
         sid = conversation.sid
@@ -184,6 +211,8 @@ class SessionManager:
 
     async def _cleanup_detached_conversations(self):
         while should_continue():
+            logger.info(f'Attached conversations: {len(self._active_conversations)}')
+            logger.info(f'Detached conversations: {len(self._detached_conversations)}')
             try:
                 async with self._conversations_lock:
                     # Create a list of items to process to avoid modifying dict during iteration
@@ -192,7 +221,7 @@ class SessionManager:
                         await conversation.disconnect()
                         self._detached_conversations.pop(sid, None)
 
-                await asyncio.sleep(60)
+                await asyncio.sleep(_CLEANUP_INTERVAL)
             except asyncio.CancelledError:
                 async with self._conversations_lock:
                     for conversation, _ in self._detached_conversations.values():
@@ -201,25 +230,7 @@ class SessionManager:
                 return
             except Exception:
                 logger.warning('error_cleaning_detached_conversations', exc_info=True)
-                await asyncio.sleep(15)
-    async def init_or_join_session(
-        self, sid: str, connection_id: str, session_init_data: SessionInitData
-    ):
-        await self.sio.enter_room(connection_id, ROOM_KEY.format(sid=sid))
-        self.local_connection_id_to_session_id[connection_id] = sid
-
-        # If we have a local session running, use that
-        session = self.local_sessions_by_sid.get(sid)
-        if session:
-            logger.info(f'found_local_session:{sid}')
-            return session.agent_session.event_stream
-
-        # If there is a remote session running, retrieve existing events for that
-        redis_client = self._get_redis_client()
-        if redis_client and await self._is_session_running_in_cluster(sid):
-            return EventStream(sid, self.file_store)
-
-        return await self.start_local_session(sid, session_init_data)
+                await asyncio.sleep(_CLEANUP_EXCEPTION_WAIT_TIME)
 
     async def _is_session_running_in_cluster(self, sid: str) -> bool:
         """As the rest of the cluster if a session is running. Wait a for a short timeout for a reply"""
@@ -274,9 +285,8 @@ class SessionManager:
         finally:
             self._has_remote_connections_flags.pop(sid)
 
-    async def start_local_session(self, sid: str, session_init_data: SessionInitData):
-        # Start a new local session
-        logger.info(f'start_new_local_session:{sid}')
+    async def start_agent_loop(self, sid: str, session_init_data: SessionInitData):
+        logger.info(f'start_agent_loop:{sid}')
         session = Session(
             sid=sid, file_store=self.file_store, config=self.config, sio=self.sio
         )
@@ -320,35 +330,30 @@ class SessionManager:
 
     async def disconnect_from_session(self, connection_id: str):
         sid = self.local_connection_id_to_session_id.pop(connection_id, None)
+        logger.info(f'disconnect_from_session:{connection_id}:{sid}')
         if not sid:
             # This can occur if the init action was never run.
             logger.warning(f'disconnect_from_uninitialized_session:{connection_id}')
             return
 
-        session = self.local_sessions_by_sid.get(sid)
-        if session:
-            logger.info(f'close_session:{connection_id}:{sid}')
-            if should_continue():
-                asyncio.create_task(self._cleanup_session_later(session))
-            else:
-                await self._close_session(session)
+        if should_continue():
+            asyncio.create_task(self._cleanup_session_later(sid))
+        else:
+            await self._close_session(sid)
 
-    async def _cleanup_session_later(self, session: Session):
+    async def _cleanup_session_later(self, sid: str):
         # Once there have been no connections to a session for a reasonable period, we close it
         try:
             await asyncio.sleep(self.config.sandbox.close_delay)
         finally:
             # If the sleep was cancelled, we still want to close these
-            await self._cleanup_session(session)
+            await self._cleanup_session(sid)
 
-    async def _cleanup_session(self, session: Session):
+    async def _cleanup_session(self, sid: str) -> bool:
         # Get local connections
+        logger.info(f'_cleanup_session:{sid}')
         has_local_connections = next(
-            (
-                True
-                for v in self.local_connection_id_to_session_id.values()
-                if v == session.sid
-            ),
+            (True for v in self.local_connection_id_to_session_id.values() if v == sid),
             False,
         )
         if has_local_connections:
@@ -356,33 +361,38 @@ class SessionManager:
 
         # If no local connections, get connections through redis
         redis_client = self._get_redis_client()
-        if redis_client and await self._has_remote_connections(session.sid):
+        if redis_client and await self._has_remote_connections(sid):
             return False
 
         # We alert the cluster in case they are interested
         if redis_client:
             await redis_client.publish(
                 'oh_event',
-                json.dumps({'sid': session.sid, 'message_type': 'session_closing'}),
+                json.dumps({'sid': sid, 'message_type': 'session_closing'}),
             )
 
-        await self._close_session(session)
+        await self._close_session(sid)
         return True
 
-    async def _close_session(self, session: Session):
-        logger.info(f'_close_session:{session.sid}')
+    async def _close_session(self, sid: str):
+        logger.info(f'_close_session:{sid}')
 
         # Clear up local variables
         connection_ids_to_remove = list(
             connection_id
             for connection_id, sid in self.local_connection_id_to_session_id.items()
-            if sid == session.sid
+            if sid == sid
         )
+        logger.info(f'removing connections: {connection_ids_to_remove}')
         for connnnection_id in connection_ids_to_remove:
             self.local_connection_id_to_session_id.pop(connnnection_id, None)
 
-        self.local_sessions_by_sid.pop(session.sid, None)
+        session = self.local_sessions_by_sid.pop(sid, None)
+        if not session:
+            logger.warning(f'no_session_to_close:{sid}')
+            return
 
+        logger.info(f'closing_session:{session.sid}')
         # We alert the cluster in case they are interested
         redis_client = self._get_redis_client()
         if redis_client:
@@ -391,4 +401,5 @@ class SessionManager:
                 json.dumps({'sid': session.sid, 'message_type': 'session_closing'}),
             )
 
-        session.close()
+        await call_sync_from_async(session.close)
+        logger.info(f'closed_session:{session.sid}')
