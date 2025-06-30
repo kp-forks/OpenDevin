@@ -39,6 +39,7 @@ class GitHubService(BaseGitService, GitService):
 
     The class is instantiated via get_impl() in openhands.server.shared.py.
     """
+
     BASE_URL = 'https://api.github.com'
     token: SecretStr = SecretStr('')
     refresh = False
@@ -71,7 +72,9 @@ class GitHubService(BaseGitService, GitService):
     async def _get_github_headers(self) -> dict:
         """Retrieve the GH Token from settings store to construct the headers."""
         if not self.token:
-            self.token = await self.get_latest_token()
+            latest_token = await self.get_latest_token()
+            if latest_token:
+                self.token = latest_token
 
         return {
             'Authorization': f'Bearer {self.token.get_secret_value() if self.token else ""}',
@@ -132,7 +135,7 @@ class GitHubService(BaseGitService, GitService):
         response, _ = await self._make_request(url)
 
         return User(
-            id=response.get('id'),
+            id=str(response.get('id', '')),
             login=response.get('login'),
             avatar_url=response.get('avatar_url'),
             company=response.get('company'),
@@ -228,8 +231,8 @@ class GitHubService(BaseGitService, GitService):
         # Convert to Repository objects
         return [
             Repository(
-                id=repo.get('id'),
-                full_name=repo.get('full_name'),
+                id=str(repo.get('id')),  # type: ignore[arg-type]
+                full_name=repo.get('full_name'),  # type: ignore[arg-type]
                 stargazers_count=repo.get('stargazers_count'),
                 git_provider=ProviderType.GITHUB,
                 is_public=not repo.get('private', True),
@@ -261,7 +264,7 @@ class GitHubService(BaseGitService, GitService):
 
         repos = [
             Repository(
-                id=repo.get('id'),
+                id=str(repo.get('id')),
                 full_name=repo.get('full_name'),
                 stargazers_count=repo.get('stargazers_count'),
                 git_provider=ProviderType.GITHUB,
@@ -406,7 +409,7 @@ class GitHubService(BaseGitService, GitService):
         repo, _ = await self._make_request(url)
 
         return Repository(
-            id=repo.get('id'),
+            id=str(repo.get('id')),
             full_name=repo.get('full_name'),
             stargazers_count=repo.get('stargazers_count'),
             git_provider=ProviderType.GITHUB,
@@ -483,35 +486,29 @@ class GitHubService(BaseGitService, GitService):
             - PR URL when successful
             - Error message when unsuccessful
         """
-        try:
-            url = f'{self.BASE_URL}/repos/{repo_name}/pulls'
 
-            # Set default body if none provided
-            if not body:
-                body = f'Merging changes from {source_branch} into {target_branch}'
+        url = f'{self.BASE_URL}/repos/{repo_name}/pulls'
 
-            # Prepare the request payload
-            payload = {
-                'title': title,
-                'head': source_branch,
-                'base': target_branch,
-                'body': body,
-                'draft': draft,
-            }
+        # Set default body if none provided
+        if not body:
+            body = f'Merging changes from {source_branch} into {target_branch}'
 
-            # Make the POST request to create the PR
-            response, _ = await self._make_request(
-                url=url, params=payload, method=RequestMethod.POST
-            )
+        # Prepare the request payload
+        payload = {
+            'title': title,
+            'head': source_branch,
+            'base': target_branch,
+            'body': body,
+            'draft': draft,
+        }
 
-            # Return the HTML URL of the created PR
-            if 'html_url' in response:
-                return response['html_url']
-            else:
-                return f'PR created but URL not found in response: {response}'
+        # Make the POST request to create the PR
+        response, _ = await self._make_request(
+            url=url, params=payload, method=RequestMethod.POST
+        )
 
-        except Exception as e:
-            return f'Error creating pull request: {str(e)}'
+        # Return the HTML URL of the created PR
+        return response['html_url']
 
 
 github_service_cls = os.environ.get(
